@@ -9,7 +9,7 @@
 # for additional reference on schema see:
 # https://github.com/mapbox/node-mbtiles/blob/master/lib/schema.sql
 
-import sqlite3, uuid, sys, logging, time, os, json, zlib
+import sqlite3, uuid, sys, logging, time, os, json, zlib, hashlib
 
 logger = logging.getLogger(__name__)
 
@@ -18,17 +18,42 @@ def flip_y(zoom, y):
 
 def mbtiles_setup(cur):
     cur.execute("""
-        create table tiles (
+        create table images (
+            tile_data blob,
+            tile_id VARCHAR(256));
+            """)
+    cur.execute("""
+        create table map (
             zoom_level integer,
             tile_column integer,
             tile_row integer,
-            tile_data blob);
+            tile_id VARCHAR(256),
+            grid_id text);
+            """)
+    cur.execute("""
+        create view tiles as
+            select
+                map.zoom_level as zoom_level,
+                map.tile_column as tile_column,
+                map.tile_row as tile_row,
+                images.tile_data as tile_data
+            from map
+            join images on images.tile_id = map.tile_id;
+            """)
+    cur.execute("""
+        create unique index images_id on images (tile_id);
+            """)
+    cur.execute("""
+        create unique index map_index on map (zoom_level, tile_column, tile_row);
             """)
     cur.execute("""create table metadata
         (name text, value text);""")
     cur.execute("""create unique index name on metadata (name);""")
-    cur.execute("""create unique index tile_index on tiles
-        (zoom_level, tile_column, tile_row);""")
+    #cur.execute("""create unique index tile_index on tiles
+    #    (zoom_level, tile_column, tile_row);""")
+    #cur.execute("""
+    #    create unique index name on metadata (name);
+    #        """)
 
 def mbtiles_connect(mbtiles_file):
     try:
@@ -156,6 +181,7 @@ def disk_to_mbtiles(directory_path, mbtiles_file, **kwargs):
     count = 0
     start_time = time.time()
     msg = ""
+    dupes=0
 
     for zoomDir in getDirs(directory_path):
         if kwargs.get("scheme") == 'ags':
@@ -183,10 +209,19 @@ def disk_to_mbtiles(directory_path, mbtiles_file, **kwargs):
                         y = int(img)
 
                     logger.debug(' Read tile from Zoom (z): %i\tCol (x): %i\tRow (y): %i' % (z, x, y))
-                    cur.execute("""insert into tiles (zoom_level,
-                        tile_column, tile_row, tile_data) values
-                        (?, ?, ?, ?);""",
-                        (z, x, y, sqlite3.Binary(f.read())))
+                    bin = f.read()
+                    m = hashlib.md5()
+                    m.update(bin)
+                    md5 = m.hexdigest()
+                    try:
+                        cur.execute("""insert into images (tile_data, tile_id) values (?, ?);""", (sqlite3.Binary(bin), md5))
+                    except Exception, e:
+                        # errors are duplicate tiles
+                        dupes+=1
+                    cur.execute("""insert into map (zoom_level,
+                        tile_column, tile_row, tile_id, grid_id) values
+                        (?, ?, ?, ?, ?);""",
+                        (z, x, y, md5, 1))
                     f.close()
                     count = count + 1
                     if (count % 100) == 0:
@@ -198,6 +233,7 @@ def disk_to_mbtiles(directory_path, mbtiles_file, **kwargs):
                         logger.warning('grid.json interactivity import not yet supported\n')
                         grid_warning= False
     logger.debug('tiles inserted.')
+    logger.debug('%s duplicates', dupes)
     optimize_database(con)
 
 def mbtiles_to_disk(mbtiles_file, directory_path, **kwargs):
